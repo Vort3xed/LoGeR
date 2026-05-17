@@ -323,3 +323,64 @@ class StreamingLoGeR:
         conf0 = conf[0].detach()
         conf0 = torch.sigmoid(conf0.float())
         return conf0.mean(dim=(1, 2, 3)).cpu()
+
+    def latest_newest_pointcloud(
+        self, max_points: int = 3000, min_confidence: float = 0.2
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """Downsampled world-space pointcloud for the newest frame.
+
+        Returns ``(xyz, rgb)``:
+          - xyz: (K, 3) float32 CPU tensor of world coordinates
+          - rgb: (K, 3) uint8 CPU tensor sampled from the input frame, or None
+                 if the image buffer is empty.
+
+        K <= max_points. We keep all pixels above ``min_confidence`` if a conf
+        head exists; if too few pass, we fall back to top-K by confidence so
+        we always emit *something* when there are points to emit.
+        """
+        if self._latest_predictions is None:
+            return None
+        pts = self._latest_predictions.get("points", None)  # (B, N, H, W, 3) world
+        if pts is None:
+            return None
+        conf = self._latest_predictions.get("conf", None)   # (B, N, H, W, 1) logits
+
+        # Newest-frame, flattened pixel-indexed.
+        _, _, H, W, _ = pts.shape
+        flat_n = H * W
+        pts_flat = pts[0, -1].detach().reshape(flat_n, 3).float()  # (flat_n, 3)
+
+        # Build a single set of chosen pixel indices, then sample xyz + rgb from it.
+        if conf is not None:
+            conf_flat = torch.sigmoid(conf[0, -1].detach().float().reshape(flat_n))
+            kept = (conf_flat >= min_confidence).nonzero(as_tuple=False).squeeze(-1)
+            if kept.numel() < min(64, max_points):
+                # Fallback: top-K by confidence, regardless of threshold
+                k = min(max_points, flat_n)
+                kept = torch.topk(conf_flat, k=k, largest=True).indices
+            if kept.numel() > max_points:
+                weights = conf_flat[kept]
+                probs = weights / weights.sum().clamp(min=1e-8)
+                chosen_rel = torch.multinomial(probs, max_points, replacement=False)
+                kept = kept[chosen_rel]
+        else:
+            kept = torch.arange(flat_n, device=pts.device)
+            if kept.numel() > max_points:
+                kept = kept[torch.randperm(kept.numel(), device=pts.device)[:max_points]]
+
+        xyz = pts_flat[kept].cpu()
+
+        rgb: Optional[torch.Tensor] = None
+        if len(self._img_buf) > 0:
+            img_n = self._img_buf[-1].detach().float().cpu()
+            if img_n.dim() == 4:
+                img_n = img_n[0]
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img_n = (img_n * std + mean).clamp(0, 1) * 255.0
+            kept_cpu = kept.cpu()
+            hh = (kept_cpu // W).long()
+            ww = (kept_cpu % W).long()
+            rgb = img_n[:, hh, ww].permute(1, 0).to(torch.uint8)
+
+        return xyz, rgb

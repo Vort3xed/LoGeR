@@ -3,3 +3,6 @@ results*/
 convert_ckpt_to_params.py
 *.pt
 .venv/
+node_modules/
+web/dist/
+runs/

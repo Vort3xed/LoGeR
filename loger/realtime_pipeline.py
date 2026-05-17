@@ -124,14 +124,24 @@ class RealtimePipeline:
         self.extrapolated_frames = 0
 
         # Optional callback fired by worker when a new anchor is committed.
-        # Signature: callback(anchor_frame_idx: int, anchor_pose: np.ndarray)
+        # Signature: callback(anchor_frame_idx: int, anchor_pose: np.ndarray,
+        #                     pointcloud: Optional[dict])
+        # pointcloud dict has keys: "xyz" (K,3 float32), "rgb" (K,3 uint8 or None).
         # Called from worker thread — callback should be quick + thread-safe.
-        self._anchor_callback: Optional[Callable[[int, "np.ndarray"], None]] = None
+        self._anchor_callback: Optional[Callable[..., None]] = None
+        self._emit_pointcloud: bool = False
+        self._pcd_max_points: int = 3000
 
-    def set_anchor_callback(self, cb) -> None:
+    def set_anchor_callback(self, cb, emit_pointcloud: bool = False,
+                            max_points: int = 3000) -> None:
         """Register a fn to call when the worker commits a new anchor pose.
-        Useful for live viz: shows when a model inference actually lands."""
+
+        If ``emit_pointcloud`` is True, the callback receives a third arg with
+        a dict {"xyz": (K,3) np.float32, "rgb": (K,3) np.uint8 or None}.
+        """
         self._anchor_callback = cb
+        self._emit_pointcloud = emit_pointcloud
+        self._pcd_max_points = max_points
 
     # ------------------------------------------------------------- lifecycle
 
@@ -266,9 +276,22 @@ class RealtimePipeline:
                         try:
                             anchor_pose = self.trajectory.get_pose(frame_idx)
                             if anchor_pose is not None:
-                                self._anchor_callback(frame_idx, anchor_pose)
+                                pcd = None
+                                if self._emit_pointcloud:
+                                    res = self._streamer.latest_newest_pointcloud(
+                                        max_points=self._pcd_max_points
+                                    )
+                                    if res is not None:
+                                        xyz, rgb = res
+                                        pcd = {
+                                            "xyz": xyz.numpy().astype(np.float32),
+                                            "rgb": rgb.numpy() if rgb is not None else None,
+                                        }
+                                self._anchor_callback(frame_idx, anchor_pose, pcd)
                         except Exception:
-                            pass  # callback errors must not crash the worker
+                            import traceback
+                            traceback.print_exc()
+                            # callback errors must not crash the worker
 
     # --------------------------------------------------------------- stats
 
